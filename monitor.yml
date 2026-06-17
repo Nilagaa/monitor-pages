@@ -1,0 +1,46 @@
+name: Facebook Page Monitor
+
+on:
+  schedule:
+    # Runs every 7 minutes. GitHub's scheduler is best-effort and can lag
+    # a few minutes under load, so real-world timing is roughly 5-10 min.
+    - cron: "*/7 * * * *"
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+# Prevent overlapping runs from racing on state.json
+concurrency:
+  group: fb-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Commit updated state
+        if: always()
+        run: |
+          git config user.name "fb-monitor-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update monitor state [skip ci]"
+          git push
