@@ -2,9 +2,22 @@
 """
 Facebook Page Post Monitor -> Telegram Notifier
 
-Checks a list of public Facebook pages (via the lightweight mbasic.facebook.com
-mobile interface) for new posts, and sends a Telegram message for each new post
+Checks a list of public Facebook pages (via the m.facebook.com mobile
+interface) for new posts, and sends a Telegram message for each new post
 found. Designed to run on a schedule (e.g. every 5-10 min via GitHub Actions).
+
+NOTE: mbasic.facebook.com (the interface this script originally used) was
+retired by Facebook in late 2024. This version targets m.facebook.com
+instead, and uses curl_cffi (rather than plain `requests`) to impersonate a
+real browser's TLS/JA3 fingerprint -- plain `requests` gets bounced to a
+login wall almost immediately because Facebook fingerprints the TLS
+handshake, not just the User-Agent header. This is a workaround for
+Facebook's current anti-bot behavior as best understood right now, not a
+guarantee: Facebook can and does change this, and shared CI IPs (like
+GitHub Actions runners) are more likely to get flagged than a residential
+IP regardless of fingerprinting. If checks start failing again across ALL
+pages at once, that's the first thing to suspect -- see the "all pages
+failed" alert logic below.
 
 State (last-seen post per page, and failure counters) is persisted to state.json,
 which the GitHub Action commits back to the repo between runs.
@@ -15,8 +28,11 @@ import re
 import json
 import sys
 import time
+import random
 import hashlib
-import requests
+import requests  # used only for the Telegram API call
+from curl_cffi import requests as cf_requests  # used for Facebook fetches (TLS impersonation)
+from curl_cffi.requests.exceptions import RequestException as CFRequestException
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -30,6 +46,11 @@ PAGES = [
     {"name": "Love Tayo ni Onza", "id": "LoveTayoniOnza1"},
 ]
 
+# Reuse one impersonated session across all page checks in a run, the way a
+# real browser would keep cookies/connection state rather than starting cold
+# on every request.
+SESSION = cf_requests.Session()
+
 STATE_FILE = "state.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -42,13 +63,25 @@ DEAD_THRESHOLD = 36
 # How many posts back to look at / notify on first run (avoid spamming old history).
 MAX_POSTS_PER_PAGE = 5
 
+# User-Agent should roughly match the curl_cffi `impersonate` profile used in
+# fetch_page_html() below (CF_IMPERSONATE) so the TLS fingerprint and the
+# declared browser agree with each other.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/115.0 Mobile Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-BASE_URL = "https://mbasic.facebook.com"
+# curl_cffi impersonation target -- keep this aligned with the User-Agent above.
+CF_IMPERSONATE = "safari17_0"
+
+BASE_URL = "https://m.facebook.com"
+
+# How many requests an IP can plausibly make before Facebook gets suspicious.
+# Used only to add a small randomized human-ish delay between page checks
+# (see main()); this is not a hard rate limiter.
+REQUEST_DELAY_RANGE = (3, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +107,16 @@ def get_page_state(state, page_id):
         "last_success_ts": None,
         "dead_alert_sent": False,
         "first_run_done": False,
+    })
+
+
+def get_global_state(state):
+    """Tracks consecutive runs where EVERY page failed, which usually points
+    at the IP/fingerprint being blocked rather than any single page's HTML
+    changing -- worth a different, faster alert than the per-page one."""
+    return state.setdefault("_global", {
+        "consecutive_all_failed_runs": 0,
+        "all_failed_alert_sent": False,
     })
 
 
@@ -108,16 +151,24 @@ def send_telegram(text):
 
 
 # ---------------------------------------------------------------------------
-# Facebook scraping (mbasic)
+# Facebook scraping (m.facebook.com)
 # ---------------------------------------------------------------------------
 
 def fetch_page_html(page_id):
-    """Fetch the mbasic page for a given page id/username."""
-    if page_id.startswith("profile.php"):
-        url = f"{BASE_URL}/{page_id}"
-    else:
-        url = f"{BASE_URL}/{page_id}"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    """Fetch the m.facebook.com page for a given page id/username.
+
+    Uses curl_cffi (not plain `requests`) so the TLS/JA3 handshake matches a
+    real browser -- a plain `requests.get()` gets redirected to a login wall
+    almost immediately regardless of headers, because Facebook fingerprints
+    the connection itself, not just the User-Agent string.
+    """
+    url = f"{BASE_URL}/{page_id}"
+    resp = SESSION.get(
+        url,
+        headers=HEADERS,
+        impersonate=CF_IMPERSONATE,
+        timeout=20,
+    )
     resp.raise_for_status()
     return resp.text
 
@@ -140,16 +191,17 @@ def looks_like_blocked_or_login(html):
 
 def extract_posts(html):
     """
-    Parse posts out of an mbasic Facebook page HTML.
+    Parse posts out of an m.facebook.com page HTML.
 
-    mbasic's structure changes periodically, so this uses a few fallback
-    strategies. Returns a list of dicts: {id, text, link}, most recent first.
+    Facebook's mobile markup changes periodically and varies by page type,
+    so this tries two strategies in order and returns whichever finds posts
+    first. Returns a list of dicts: {id, text, link}, most recent first.
     """
     soup = BeautifulSoup(html, "lxml")
     posts = []
 
     # Strategy 1: look for article-like containers with a permalink to a story
-    # mbasic typically has links like /story.php?story_fbid=...&id=...
+    # m.facebook.com typically has links like /story.php?story_fbid=...&id=...
     # or /<page>/posts/<id>
     story_links = soup.find_all("a", href=re.compile(r"(story\.php\?story_fbid=|/posts/|/photo\.php\?fbid=|/videos/)"))
 
@@ -191,6 +243,42 @@ def extract_posts(html):
         if len(posts) >= MAX_POSTS_PER_PAGE:
             break
 
+    if posts:
+        return posts
+
+    # Strategy 2 (fallback): m.facebook.com often wraps each timeline post in
+    # a container carrying a data-ft="{...}" attribute (used internally by FB
+    # for click tracking) even when it has no direct story-permalink anchor
+    # matching Strategy 1's patterns. Use that as a post boundary instead.
+    for container in soup.find_all(attrs={"data-ft": True}):
+        raw_ft = container.get("data-ft", "")
+        text = container.get_text(separator=" ", strip=True)
+        if not text:
+            continue
+
+        link_tag = container.find("a", href=re.compile(r"(story\.php|/posts/|/photo\.php|/videos/|permalink)"))
+        href = link_tag.get("href", "") if link_tag else ""
+
+        post_id = make_post_id(href) if href else None
+        if not post_id:
+            # No usable href; derive an id from the data-ft payload or, last
+            # resort, the post text itself so we can still detect "new".
+            story_key = re.search(r'"mf_story_key"\s*:\s*"?([\w-]+)"?', raw_ft)
+            post_id = story_key.group(1) if story_key else hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+        if post_id in seen_ids:
+            continue
+        seen_ids.add(post_id)
+
+        posts.append({
+            "id": post_id,
+            "text": text[:600],
+            "link": (href if href.startswith("http") else BASE_URL + href) if href else BASE_URL,
+        })
+
+        if len(posts) >= MAX_POSTS_PER_PAGE:
+            break
+
     return posts
 
 
@@ -216,25 +304,27 @@ def make_post_id(href):
 # ---------------------------------------------------------------------------
 
 def check_page(page, state):
+    """Returns True if this page check succeeded (content fetched and
+    parsed), False otherwise. Used by main() to track all-pages-failed runs."""
     page_id = page["id"]
     page_name = page["name"]
     pstate = get_page_state(state, page_id)
 
     try:
         html = fetch_page_html(page_id)
-    except requests.RequestException as e:
+    except CFRequestException as e:
         handle_failure(page_name, pstate, f"network error: {e}")
-        return
+        return False
 
     if looks_like_blocked_or_login(html):
         handle_failure(page_name, pstate, "received a login/checkpoint page instead of content")
-        return
+        return False
 
     posts = extract_posts(html)
 
     if not posts:
         handle_failure(page_name, pstate, "no posts found (layout may have changed)")
-        return
+        return False
 
     # Success: reset failure tracking
     pstate["consecutive_failures"] = 0
@@ -251,7 +341,7 @@ def check_page(page, state):
         pstate["first_run_done"] = True
         pstate["last_post_ids"] = [p["id"] for p in posts]
         print(f"[{page_name}] First run: recorded {len(posts)} existing posts as baseline.")
-        return
+        return True
 
     if new_posts:
         # new_posts came back most-recent-first; notify oldest-first so chat order makes sense
@@ -271,6 +361,7 @@ def check_page(page, state):
     combined = [p["id"] for p in posts] + pstate["last_post_ids"]
     deduped = list(dict.fromkeys(combined))
     pstate["last_post_ids"] = deduped[: MAX_POSTS_PER_PAGE * 2]
+    return True
 
 
 def handle_failure(page_name, pstate, reason):
@@ -299,23 +390,61 @@ def handle_failure(page_name, pstate, reason):
 def main():
     state = load_state()
     any_exception = False
+    results = []  # True/False per page, success or not
 
     for page in PAGES:
         try:
-            check_page(page, state)
+            ok = check_page(page, state)
+            results.append(bool(ok))
         except Exception as e:
             any_exception = True
+            results.append(False)
             print(f"[{page['name']}] Unexpected exception: {e}", file=sys.stderr)
             pstate = get_page_state(state, page["id"])
             handle_failure(page["name"], pstate, f"unexpected exception: {e}")
-        time.sleep(2)  # small courtesy delay between page requests
+        # Randomized delay instead of a fixed one -- consistent fixed-interval
+        # timing between requests is itself a bot signal.
+        time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
 
+    handle_global_failure_tracking(state, results)
     save_state(state)
 
     if any_exception:
         # Non-zero exit so GitHub Actions can also flag the run as failed
         # (separate safety net on top of Telegram alerts).
         sys.exit(1)
+
+
+def handle_global_failure_tracking(state, results):
+    """If EVERY page failed in this run, that's much more likely to mean the
+    runner's IP/fingerprint got blocked than that all 4 pages independently
+    changed their HTML at once -- alert on that distinctly, and faster than
+    the per-page DEAD_THRESHOLD, since it points at a different fix
+    (rotate hosting/IP, re-check the impersonate profile) rather than a
+    parser tweak."""
+    gstate = get_global_state(state)
+
+    if results and all(r is False for r in results):
+        gstate["consecutive_all_failed_runs"] += 1
+    else:
+        if gstate["consecutive_all_failed_runs"] > 0:
+            print("Recovered from an all-pages-failed streak.")
+        gstate["consecutive_all_failed_runs"] = 0
+        gstate["all_failed_alert_sent"] = False
+        return
+
+    # 6 consecutive fully-failed runs (~30-60 min depending on actual
+    # schedule timing) before alerting -- enough to rule out one bad request,
+    # short of the per-page DEAD_THRESHOLD so this fires first when relevant.
+    ALL_FAILED_THRESHOLD = 6
+    if gstate["consecutive_all_failed_runs"] >= ALL_FAILED_THRESHOLD and not gstate["all_failed_alert_sent"]:
+        gstate["all_failed_alert_sent"] = True
+        send_telegram(
+            f"🚫 <b>All monitored pages failed</b> for {gstate['consecutive_all_failed_runs']} checks in a row.\n\n"
+            f"This usually means the request fingerprint/IP got blocked by Facebook, "
+            f"not that every page's layout changed at once. Worth checking before "
+            f"waiting on the individual per-page alerts."
+        )
 
 
 if __name__ == "__main__":

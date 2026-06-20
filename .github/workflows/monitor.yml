@@ -7,6 +7,11 @@ on:
     - cron: "*/7 * * * *"
   workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
 
+# Without this, the default GITHUB_TOKEN is read-only and the "Commit
+# updated state" step below fails with a 403 on git push.
+permissions:
+  contents: write
+
 # Prevent overlapping runs from racing on state.json
 concurrency:
   group: fb-monitor
