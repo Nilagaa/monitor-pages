@@ -1,34 +1,34 @@
 {
   "AntipoloCity1stCongressionalDistrictOffice": {
     "last_post_ids": [],
-    "consecutive_failures": 707,
+    "consecutive_failures": 708,
     "last_success_ts": null,
     "dead_alert_sent": true,
     "first_run_done": false
   },
   "profile.php?id=61553138835377": {
     "last_post_ids": [],
-    "consecutive_failures": 707,
+    "consecutive_failures": 708,
     "last_success_ts": null,
     "dead_alert_sent": true,
     "first_run_done": false
   },
   "junynaresofficial": {
     "last_post_ids": [],
-    "consecutive_failures": 707,
+    "consecutive_failures": 708,
     "last_success_ts": null,
     "dead_alert_sent": true,
     "first_run_done": false
   },
   "LoveTayoniOnza1": {
     "last_post_ids": [],
-    "consecutive_failures": 707,
+    "consecutive_failures": 708,
     "last_success_ts": null,
     "dead_alert_sent": true,
     "first_run_done": false
   },
   "_global": {
-    "consecutive_all_failed_runs": 707,
+    "consecutive_all_failed_runs": 708,
     "all_failed_alert_sent": true
   }
 }
